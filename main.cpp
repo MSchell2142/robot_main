@@ -76,7 +76,8 @@ static bool chase_ball_once()
 
         if (match_return_now()) return false;
 
-        uint8_t dir = get_camera_direction();
+        uint8_t raw = get_camera_direction();
+        uint8_t dir = raw & 0x0F;
 
         int16_t cx = VISION_FRAME_W / 2, cy = 0;
         get_blob_midpoint(&cx, &cy);
@@ -191,26 +192,52 @@ int main()
     printf("[init] encoders...\n");
     init_encoders();
 
-    // encoder_id_test();
+    // encoder_id_test();       // hand-spin diagnostic; uncomment if encoders need re-verifying
+    // encoder1_test();         // focused 3-phase test for encoder 1 only; uncomment to run
+    // encoder_rotation_test(); // spin one full turn, read count = true PPR; uncomment to run
 
     printf("[init] motors...\n");
     init_motors();
+    // motor_balance_cal();     // measure raw M2/M1 ratio; re-comment when done
+    // motor_power_test();      // re-enable once PPR is calibrated
 
     printf("[init] MPU...\n");
     init_mpu();
 
-    printf("[init] camera...\n");
-    init_camera();
+    // drive_forward_test();    // drive 24 in, check enc counts + tape measure; uncomment to run
+
+    // printf("[init] camera...\n");      // camera disabled during navigation testing
+    // init_camera();
+    // set_camera_mode(CAM_MODE_RED);
+
+    // ----- MAG NOISE TEST (Stage 2 validation) -----
+    // Hold the robot OFF the ground when this runs. Comment out
+    // when no longer needed -- this only runs at startup.
+    // mag_noise_test();   // PASS validated -- enable to re-test if mag chip is moved
 
     printf("[init] sonar...\n");
     init_sonar();
+    // while (true) { sonar_validation_test(); }  // sonar validated -- re-enable if sensors are moved
 
     printf("[init] field geometry...\n");
     g_home_side = HOME_SIDE_DEFAULT;
+    // Auto-detect home side from black boundary line.
+    // Verify LINE_SIDE_LEFT -> HOME_RIGHT (or swap) on the actual field before enabling.
+    // LineSide start_side = camera_detect_start_side();
+    // if (start_side != LINE_SIDE_NONE)
+    //     g_home_side = (start_side == LINE_SIDE_LEFT) ? HOME_RIGHT : HOME_LEFT;
+    // printf("[init] start_side=%s -> home=%s\n",
+    //        start_side == LINE_SIDE_LEFT ? "LEFT" : (start_side == LINE_SIDE_RIGHT ? "RIGHT" : "NONE"),
+    //        g_home_side == HOME_LEFT ? "LEFT" : "RIGHT");
     set_pose(field_home_x_in(), field_home_y_in(), field_start_heading_deg());
     field_init();
 
+    // mag_auto_cal();           // offsets now hardcoded in MAG_OFFSET_X/Y -- re-enable only if mag chip is moved
+
     printf("[init] done -- all systems go\n");
+
+    // drive_raw_test();              // hard+soft correction kick test -- re-enable when needed
+    // while (true) { distance_calibration_test(); }  // calibrated: WHEEL_RADIUS=0.034313 m
 
     s_match_start_ms = to_ms_since_boot(get_absolute_time());
 
@@ -251,75 +278,48 @@ int main()
                     continue;
                 }
 
-                bool is_boundary = field_current_is_phase_boundary();
-                int  wp_idx      = field_current_waypoint_index();
-                int  wp_total    = field_waypoint_count();
+                bool is_boundary   = field_current_is_phase_boundary();
+                bool is_checkpoint = field_current_is_scan_checkpoint();
+                int  wp_idx        = field_current_waypoint_index();
+                int  wp_total      = field_waypoint_count();
 
-                printf("\n[COVERAGE] WP %d/%d -> (%.1f, %.1f)  pos=(%.1f, %.1f)  head=%.1f%s\n",
+                printf("\n[COVERAGE] WP %d/%d -> (%.1f, %.1f)  pos=(%.1f, %.1f)  head=%.1f%s%s\n",
                        wp_idx, wp_total,
                        (double)wx, (double)wy,
                        (double)get_pos_x_in(), (double)get_pos_y_in(),
                        (double)fused_heading,
-                       is_boundary ? "  [phase boundary]" : "");
+                       is_boundary   ? "  [phase boundary]"  : "",
+                       is_checkpoint ? "  [scan checkpoint]" : "");
 
-                bool ball_seen = false;
-                go_to_xy_scanning(wx, wy, &ball_seen);
+                // Drive to waypoint without mid-run scanning. The overhead of
+                // camera SPI during driving was causing stalls, so camera reads
+                // are deferred to scan checkpoints where the robot is stopped.
+                go_to_xy_approx(wx, wy, field_current_tolerance_in());
 
-                if (ball_seen) {
-                    // CONFIRM the detection across multiple frames before
-                    // committing to a chase. The vision system can briefly
-                    // pass shape gates on noise, lighting glitches, or
-                    // partial views of non-ball objects (markings, tape,
-                    // wall colors, etc.). A real ball will be visible
-                    // across many consecutive frames; a ghost won't.
-                    //
-                    // While confirming, we stay stationary so we don't
-                    // drift off the waypoint we were heading for.
-                    const int  CONFIRM_REQUIRED = 3;
-                    const int  CONFIRM_MAX_TRIES = 6;   // up to 6 frames to find 3
-                    int        confirms = 1;            // already saw 1 in scan
-                    int        attempts = 1;
-                    stop();
-
-                    while (confirms < CONFIRM_REQUIRED && attempts < CONFIRM_MAX_TRIES) {
-                        sleep_ms(10);
-                        mpu_update();
-                        uint8_t d = get_camera_direction();
-                        attempts++;
-                        if (d != CAM_NONE) {
-                            confirms++;
-                            printf("  [confirm] %d/%d (frame %d, dir=%u)\n",
-                                   confirms, CONFIRM_REQUIRED, attempts, d);
-                        } else {
-                            printf("  [confirm] miss (frame %d, %d/%d so far)\n",
-                                   attempts, confirms, CONFIRM_REQUIRED);
-                        }
-                    }
-
-                    if (confirms >= CONFIRM_REQUIRED) {
-                        printf("  [confirm] CONFIRMED -> chasing\n");
-                        state = ST_CHASING;
-                        // Don't advance — when chase ends, we'll re-attempt
-                        // this same waypoint from new position.
-                    } else {
-                        printf("  [confirm] REJECTED as ghost (only %d/%d) -> resume coverage\n",
-                               confirms, CONFIRM_REQUIRED);
-                        // Stay in COVERAGE. Don't advance the waypoint —
-                        // we want to retry the same WP from current pos,
-                        // which will resume the path right where we left off.
-                    }
-                } else {
-                    // Phase-boundary post-rotate: arrived at end-of-phase
-                    // waypoint, now rotate to standard final heading
-                    // before continuing into next phase.
-                    if (is_boundary) {
-                        float final_h = field_final_heading_deg();
-                        printf("[coverage] phase boundary - rotating to %.1f\n",
-                               (double)final_h);
-                        rotate_to(final_h);
-                        dispense_shake();
-                    }
+                // Camera disabled during navigation testing -- re-enable when lawnmower is validated.
+                // bool ball_seen = false;
+                // if (is_checkpoint) {
+                //     uint8_t dir = get_camera_direction();
+                //     if (dir != CAM_NONE) {
+                //         ball_seen = true;
+                //         printf("  [coverage] ball seen at checkpoint -> chasing\n");
+                //     }
+                // }
+                // if (ball_seen) {
+                //     state = ST_CHASING;
+                // } else {
+                if (is_boundary) {
+                    float final_h = field_final_heading_deg();
+                    printf("[coverage] phase boundary - rotating to %.1f\n",
+                           (double)final_h);
+                    rotate_to(final_h);
+                    dispense_shake();
+                }
+                field_advance_waypoint();
+                if (g_sonar_skip_next) {
+                    printf("[coverage] sonar blocked -- skipping next waypoint\n");
                     field_advance_waypoint();
+                    g_sonar_skip_next = false;
                 }
                 break;
             }

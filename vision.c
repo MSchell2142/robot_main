@@ -28,6 +28,16 @@
 #define RED_MIN_SATURATION   60
 #define RED_MIN_NEIGHBORS    3
 
+// ===== PER-PIXEL BLUE CLASSIFIER (tuned values) =====
+#define BLUE_MIN_B            60
+#define BLUE_B_OVER_R         40
+#define BLUE_B_OVER_G         28
+
+// ===== PER-PIXEL GREEN CLASSIFIER (tuned values) =====
+#define GREEN_MIN_G           70
+#define GREEN_G_OVER_R        20
+#define GREEN_G_OVER_B        20
+
 // ===== BALL SHAPE GATES =====
 //
 // BALL_MIN_RADIUS      — minimum card_avg (average cardinal radius from blob
@@ -116,6 +126,20 @@ static inline bool is_red(uint8_t r, uint8_t g, uint8_t b) {
     return true;
 }
 
+static inline bool is_blue(uint8_t r, uint8_t g, uint8_t b) {
+    if (b < BLUE_MIN_B)                   return false;
+    if ((int)b < (int)r + BLUE_B_OVER_R)  return false;
+    if ((int)b < (int)g + BLUE_B_OVER_G)  return false;
+    return true;
+}
+
+static inline bool is_green(uint8_t r, uint8_t g, uint8_t b) {
+    if (g < GREEN_MIN_G)                   return false;
+    if ((int)g < (int)r + GREEN_G_OVER_R)  return false;
+    if ((int)g < (int)b + GREEN_G_OVER_B)  return false;
+    return true;
+}
+
 #define FLOOD_STACK 4096
 static uint16_t s_flood_stack[FLOOD_STACK];
 
@@ -173,7 +197,7 @@ static int measure(int cx, int cy, int dx, int dy) {
     return r;
 }
 
-int detect_red_blob(const uint8_t* frame, uint32_t min_count)
+int detect_color_blob(const uint8_t* frame, uint32_t min_count, TargetColor color)
 {
     s_found        = false;
     s_count        = 0;
@@ -194,7 +218,14 @@ int detect_red_blob(const uint8_t* frame, uint32_t min_count)
             uint8_t r = (uint8_t)(((px >> 11) & 31) << 3);
             uint8_t g = (uint8_t)(((px >>  5) & 63) << 2);
             uint8_t b = (uint8_t)(( px        & 31) << 3);
-            if (is_red(r, g, b)) bmp_set(s_red, x, y);
+            bool match;
+            switch (color) {
+                case TARGET_BLUE:  match = is_blue(r, g, b);  break;
+                case TARGET_GREEN: match = is_green(r, g, b); break;
+                case TARGET_RED:
+                default:           match = is_red(r, g, b);   break;
+            }
+            if (match) bmp_set(s_red, x, y);
         }
     }
 
@@ -225,6 +256,41 @@ int detect_red_blob(const uint8_t* frame, uint32_t min_count)
         }
     }
 
+    // Pass 3b: morphological CLOSE (dilate then erode) fills small holes
+    // inside detected blobs -- particularly specular highlights where
+    // the bright spot on a glossy ball goes near-white and fails the
+    // red-dominance checks. We already dilated above, so first dilate
+    // one more time into s_temp (giving a 5x5 effective kernel), then
+    // erode that back into s_eroded to fill gaps without growing the
+    // outer boundary too aggressively.
+    for (int i = 0; i < BMP_BYTES; i++) s_temp[i] = 0;
+    for (int y = 0; y < VISION_FRAME_H; y++) {
+        for (int x = 0; x < VISION_FRAME_W; x++) {
+            bool any = false;
+            for (int dy = -1; dy <= 1 && !any; dy++) {
+                for (int dx = -1; dx <= 1 && !any; dx++) {
+                    if (bmp_get(s_eroded, x + dx, y + dy)) any = true;
+                }
+            }
+            if (any) bmp_set(s_temp, x, y);
+        }
+    }
+    // Now erode s_temp back into s_eroded -- only set pixels where ALL
+    // 8 neighbors are also set (true 3x3 erosion). Net effect: holes
+    // up to ~3 px wide get filled, outer boundary stays roughly stable.
+    for (int i = 0; i < BMP_BYTES; i++) s_eroded[i] = 0;
+    for (int y = 0; y < VISION_FRAME_H; y++) {
+        for (int x = 0; x < VISION_FRAME_W; x++) {
+            bool all = true;
+            for (int dy = -1; dy <= 1 && all; dy++) {
+                for (int dx = -1; dx <= 1 && all; dx++) {
+                    if (!bmp_get(s_temp, x + dx, y + dy)) all = false;
+                }
+            }
+            if (all) bmp_set(s_eroded, x, y);
+        }
+    }
+
     // Pass 4: flood-fill connected components
     for (int y = 0; y < VISION_FRAME_H; y++) {
         for (int x = 0; x < VISION_FRAME_W; x++) {
@@ -252,6 +318,10 @@ int detect_red_blob(const uint8_t* frame, uint32_t min_count)
 
 uint32_t get_red_pixel_count(void) {
     return s_count;
+}
+
+int detect_red_blob(const uint8_t* frame, uint32_t min_count) {
+    return detect_color_blob(frame, min_count, TARGET_RED);
 }
 
 static bool cluster_is_ball(const Cluster* cl, int16_t* r_out, float* c_out)
@@ -441,6 +511,90 @@ int get_blob_midpoint(int16_t* cx, int16_t* cy)
     if (cx) *cx = (int16_t)((s_min_x + s_max_x) / 2);
     if (cy) *cy = (int16_t)((s_min_y + s_max_y) / 2);
     return 1;
+}
+
+// ===== BLACK LINE SIDE DETECTION =====
+// Matches the Python validator: all three channels below BLACK_MAX_CHANNEL,
+// bottom half of frame only, largest cluster >= BLACK_MIN_PIXELS,
+// side determined by whether the centroid is left or right of frame center.
+#define BLACK_MAX_CHANNEL  87
+#define BLACK_MIN_PIXELS   30
+
+LineSide detect_black_line_side(const uint8_t* frame)
+{
+    for (int i = 0; i < BMP_BYTES; i++) {
+        s_red[i] = 0; s_eroded[i] = 0; s_temp[i] = 0; s_vis[i] = 0;
+    }
+
+    // Pass 1: classify black pixels in bottom half only
+    for (int y = VISION_FRAME_H / 2; y < VISION_FRAME_H; y++) {
+        const uint8_t* p = frame + y * VISION_FRAME_W * 2;
+        for (int x = 0; x < VISION_FRAME_W; x++) {
+            uint16_t pxv = ((uint16_t)p[0] << 8) | (uint16_t)p[1];
+            p += 2;
+            uint8_t r = (uint8_t)(((pxv >> 11) & 31) << 3);
+            uint8_t g = (uint8_t)(((pxv >>  5) & 63) << 2);
+            uint8_t b = (uint8_t)(( pxv        & 31) << 3);
+            if (r < BLACK_MAX_CHANNEL && g < BLACK_MAX_CHANNEL && b < BLACK_MAX_CHANNEL)
+                bmp_set(s_red, x, y);
+        }
+    }
+
+    // Pass 2: neighbor filter — keep pixels with >= RED_MIN_NEIGHBORS dark neighbors
+    for (int y = VISION_FRAME_H / 2; y < VISION_FRAME_H; y++) {
+        for (int x = 0; x < VISION_FRAME_W; x++) {
+            if (!bmp_get(s_red, x, y)) continue;
+            int n = 0;
+            for (int ny = -1; ny <= 1; ny++) {
+                for (int nx = -1; nx <= 1; nx++) {
+                    if ((nx || ny) && bmp_get(s_red, x + nx, y + ny)) n++;
+                }
+            }
+            if (n >= RED_MIN_NEIGHBORS) bmp_set(s_temp, x, y);
+        }
+    }
+
+    // Pass 3: dilate to reconnect thinned clusters
+    for (int y = VISION_FRAME_H / 2 - 1; y < VISION_FRAME_H; y++) {
+        for (int x = 0; x < VISION_FRAME_W; x++) {
+            bool any = false;
+            for (int ny = -1; ny <= 1 && !any; ny++) {
+                for (int nx = -1; nx <= 1 && !any; nx++) {
+                    if (bmp_get(s_temp, x + nx, y + ny)) any = true;
+                }
+            }
+            if (any) bmp_set(s_eroded, x, y);
+        }
+    }
+
+    // Pass 4: find largest connected component starting from bottom half
+    int best_count = 0;
+    int best_cx    = 0;
+
+    for (int y = VISION_FRAME_H / 2; y < VISION_FRAME_H; y++) {
+        for (int x = 0; x < VISION_FRAME_W; x++) {
+            if (!bmp_get(s_eroded, x, y)) continue;
+            if ( bmp_get(s_vis,    x, y)) continue;
+
+            s_sum_x = 0; s_sum_y = 0;
+            int16_t mnx, mxx, mny, mxy;
+            uint32_t count = flood(x, y, &mnx, &mxx, &mny, &mxy);
+            if ((int)count > best_count) {
+                best_count = (int)count;
+                best_cx    = (int)(s_sum_x / (int32_t)count);
+            }
+        }
+    }
+
+    if (best_count < BLACK_MIN_PIXELS) {
+        printf("[line_side] no line (best_px=%d < %d)\n", best_count, BLACK_MIN_PIXELS);
+        return LINE_SIDE_NONE;
+    }
+
+    LineSide side = (best_cx < VISION_FRAME_W / 2) ? LINE_SIDE_LEFT : LINE_SIDE_RIGHT;
+    printf("[line_side] cx=%d count=%d -> %s\n",
+           best_cx, best_count, side == LINE_SIDE_LEFT ? "LEFT" : "RIGHT");
+    return side;
 }
 
 static void px(uint8_t* f, int x, int y, uint16_t color) {

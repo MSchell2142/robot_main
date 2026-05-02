@@ -90,6 +90,13 @@ bool  field_next_waypoint(float* x, float* y);
 // the state machine to do the rotation before advancing.
 bool  field_current_is_phase_boundary();
 
+// Returns true if the *current* waypoint is a scan checkpoint: the robot
+// should stop and take a fresh camera image after arriving.
+bool  field_current_is_scan_checkpoint();
+
+// Returns how many inches short of the target the robot should stop (tolerance).
+float field_current_tolerance_in();
+
 void  field_advance_waypoint();
 void  field_reset_coverage();
 

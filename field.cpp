@@ -13,7 +13,9 @@ HomeSide g_home_side = HOME_SIDE_DEFAULT;
 struct Waypoint {
     float x;
     float y;
-    bool  is_phase_boundary;   // rotate-to-final-heading after this WP?
+    bool  is_phase_boundary;    // rotate-to-final-heading after this WP?
+    bool  is_scan_checkpoint;   // stop and take a fresh image after arriving?
+    float tolerance_in;         // stop within this many inches of the target
 };
 
 static Waypoint s_wps[MAX_WAYPOINTS];
@@ -24,7 +26,7 @@ static int      s_loop_count = 0;   // diagnostic: how many times we've looped
 // ============================================================================
 // Start pose
 // ============================================================================
-float field_home_x_in()         { return 12.0f; }
+float field_home_x_in()         { return 14.0f; }
 float field_home_y_in()         { return 12.0f; }
 float field_start_heading_deg() { return 90.0f; }
 
@@ -51,47 +53,73 @@ float field_goal_approach_y_in() { return MY_GOAL_Y_MAX_IN + 6.0f; }
 float field_final_heading_deg() { return 90.0f; }
 
 // ============================================================================
-// SCANNING PATH: Lawnmower (skips centerline sweep, starts from (12,12))
+// SCANNING PATH: Lawnmower with intermediate scan checkpoints
 // ============================================================================
 // From start (12, 12) facing +Y, the robot drives 3 long lanes parallel
-// to Y, snaking the field for full coverage:
+// to Y. Long lanes are broken into ~36-48 in segments by scan checkpoints:
+// the robot stops at each checkpoint and takes a fresh camera image instead
+// of scanning during driving.
 //
-//   WP 1: (12, 132) - lane 1: drive UP all the way along left edge
-//   WP 2: (42, 132) - top transition to lane 2
-//   WP 3: (42,  18) - lane 2: drive DOWN to safe row (NOT into goal)
-//   WP 4: (70,  18) - bottom transition to lane 3 along safe row
-//   WP 5: (70, 132) - lane 3: drive UP all the way to top
-//   WP 6: (70,  18) - return down to safe row
-//   WP 7: (42,  24) - park above goal center (3.5 ft x, 2 ft y)
-//                     [PHASE BOUNDARY] rotate to face +Y so backside is
-//                     toward the goal mouth, ready to back into goal.
+// Lane 1  (x=12, up):
+//   WP 1: (12,  48) [checkpoint] ~36 in
+//   WP 2: (12,  84) [checkpoint] ~36 in
+//   WP 3: (12, 114)              ~30 in  -- top of lane
 //
-// After WP 7, the iterator wraps back to WP 1 and the whole pattern
-// repeats. The state machine in main.cpp watches the match clock and
-// stops when time runs out.
+// Transition to lane 2:
+//   WP 4: (42, 114)              ~30 in
 //
-// Goal-clearance rule: any segment that would cross x in [24, 60] at
-// y < 18 is rerouted via y = 18 to avoid the goal-mouth speed bumps.
-// Lane 2 stops at y=18 instead of continuing to y=12 for this reason.
-// Final park at (42, 24) is 12 in above the goal mouth, safely clear.
+// Lane 2 (x=42, down to safe row y=18):
+//   WP 5: (42,  66) [checkpoint] ~48 in
+//   WP 6: (42,  18)              ~48 in
+//
+// Transition to lane 3:
+//   WP 7: (70,  18)              ~28 in
+//
+// Lane 3 (x=70, up):
+//   WP 8: (70,  66) [checkpoint] ~48 in
+//   WP 9: (70, 114)              ~48 in
+//
+// Return down (x=70):
+//   WP10: (70,  66) [checkpoint] ~48 in
+//   WP11: (70,  18)              ~48 in
+//
+// Park:
+//   WP12: (42,  24) [PHASE BOUNDARY]
+//
+// After WP12 the iterator wraps back to WP1 and the pattern repeats.
+// Goal-clearance rule: lane 2 stops at y=18 (not y=12) to avoid the
+// goal-mouth speed bumps. Final park at (42, 24) is 12 in above the goal.
 static void build_waypoints() {
     s_wp_count = 0;
     s_wp_index = 0;
 
-    s_wps[s_wp_count++] = { 12.0f, 132.0f, false };  // WP 1 - lane 1 up
-    s_wps[s_wp_count++] = { 42.0f, 132.0f, false };  // WP 2 - top transition
-    s_wps[s_wp_count++] = { 42.0f,  18.0f, false };  // WP 3 - lane 2 down (safe)
-    s_wps[s_wp_count++] = { 70.0f,  18.0f, false };  // WP 4 - bottom transition
-    s_wps[s_wp_count++] = { 70.0f, 132.0f, false };  // WP 5 - lane 3 up
-    s_wps[s_wp_count++] = { 70.0f,  18.0f, false };  // WP 6 - return down
-    s_wps[s_wp_count++] = { 42.0f,  24.0f, true  };  // WP 7 - park above goal
+    // Lane 1 (x=12, driving up from start at y=12)
+    s_wps[s_wp_count++] = { 14.0f,  48.0f, false, true,  4.0f };  // WP 1  - lane 1 checkpoint (+Y)
+    s_wps[s_wp_count++] = { 14.0f,  84.0f, false, true,  4.0f };  // WP 2  - lane 1 checkpoint (+Y)
+    s_wps[s_wp_count++] = { 14.0f, 114.0f, false, true,  2.0f };  // WP 3  - lane 1 top (+Y)
+    // Transition
+    s_wps[s_wp_count++] = { 42.0f, 114.0f, false, false, 2.0f };  // WP 4  - top transition (+X, no scan)
+    // Lane 2 (x=42, driving down to safe row)
+    s_wps[s_wp_count++] = { 42.0f,  66.0f, false, true,  4.0f };  // WP 5  - lane 2 checkpoint (-Y)
+    s_wps[s_wp_count++] = { 42.0f,  18.0f, false, true,  2.0f };  // WP 6  - lane 2 bottom (-Y)
+    // Transition
+    s_wps[s_wp_count++] = { 70.0f,  18.0f, false, false, 2.0f };  // WP 7  - bottom transition (+X, no scan)
+    // Lane 3 (x=70, driving up)
+    s_wps[s_wp_count++] = { 70.0f,  66.0f, false, true,  4.0f };  // WP 8  - lane 3 checkpoint (+Y)
+    s_wps[s_wp_count++] = { 70.0f, 114.0f, false, true,  2.0f };  // WP 9  - lane 3 top (+Y)
+    // Return down (x=70)
+    s_wps[s_wp_count++] = { 70.0f,  66.0f, false, true,  4.0f };  // WP 10 - return checkpoint (-Y)
+    s_wps[s_wp_count++] = { 70.0f,  18.0f, false, true,  2.0f };  // WP 11 - return bottom (-Y)
+    // Park
+    s_wps[s_wp_count++] = { 42.0f,  24.0f, true,  false, 2.0f };  // WP 12 - park [BOUNDARY]
 
-    printf("[field] %d waypoints (lawnmower from start):\n", s_wp_count);
+    printf("[field] %d waypoints (lawnmower + scan checkpoints):\n", s_wp_count);
     for (int i = 0; i < s_wp_count; i++) {
-        printf("  WP %2d: (%.1f, %.1f)%s\n",
+        printf("  WP %2d: (%.1f, %.1f)%s%s\n",
                i + 1,
                (double)s_wps[i].x, (double)s_wps[i].y,
-               s_wps[i].is_phase_boundary ? "  <- phase boundary" : "");
+               s_wps[i].is_phase_boundary    ? "  <- phase boundary"  : "",
+               s_wps[i].is_scan_checkpoint   ? "  <- scan checkpoint" : "");
     }
     printf("  Final heading at boundaries: %.1f deg\n",
            (double)field_final_heading_deg());
@@ -114,6 +142,16 @@ bool field_next_waypoint(float* x, float* y) {
 bool field_current_is_phase_boundary() {
     if (s_wp_index >= s_wp_count) return false;
     return s_wps[s_wp_index].is_phase_boundary;
+}
+
+bool field_current_is_scan_checkpoint() {
+    if (s_wp_index >= s_wp_count) return false;
+    return s_wps[s_wp_index].is_scan_checkpoint;
+}
+
+float field_current_tolerance_in() {
+    if (s_wp_index >= s_wp_count) return 0.0f;
+    return s_wps[s_wp_index].tolerance_in;
 }
 
 void field_advance_waypoint() {

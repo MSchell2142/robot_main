@@ -25,6 +25,13 @@ static const uint32_t CAM_INIT_TIMEOUT_MS = 3000;
 
 Arducam_Mega myCAM(CS_PIN);
 static bool s_cam_ok = false;
+static CameraMode s_cam_mode = CAM_MODE_RED;
+
+void set_camera_mode(CameraMode mode) {
+    s_cam_mode = mode;
+    printf("[camera] mode = %s\n",
+           mode == CAM_MODE_RED ? "RED" : "BLUE+GREEN");
+}
 
 // ===== INIT =====
 void init_camera()
@@ -95,6 +102,30 @@ static bool read_frame(ArducamCamera* cam,
     return true;
 }
 
+LineSide camera_detect_start_side()
+{
+    if (!s_cam_ok) {
+        printf("[camera] detect_start_side: camera not OK\n");
+        return LINE_SIDE_NONE;
+    }
+
+    static ArducamCamera* cam = myCAM.getCameraInstance();
+    static uint8_t frame_buf[FRAME_BYTES];
+    static uint8_t chunk[200];
+
+    myCAM.takePicture(CAM_IMAGE_MODE_128X128, CAM_IMAGE_PIX_FMT_RGB565);
+    uint32_t total = myCAM.getTotalLength();
+    if (total == 0 || total > (uint32_t)(FRAME_BYTES * 2)) {
+        printf("[camera] detect_start_side: bad frame size %lu\n", (unsigned long)total);
+        return LINE_SIDE_NONE;
+    }
+    if (!read_frame(cam, frame_buf, total, chunk)) {
+        printf("[camera] detect_start_side: read_frame failed\n");
+        return LINE_SIDE_NONE;
+    }
+    return detect_black_line_side(frame_buf);
+}
+
 // ===== MAIN CAMERA FUNCTION =====
 uint8_t get_camera_direction()
 {
@@ -107,7 +138,6 @@ uint8_t get_camera_direction()
     static uint32_t dbg_calls = 0;
     static uint32_t dbg_bad_total = 0;
     static uint32_t dbg_bad_read = 0;
-    static uint32_t dbg_no_clusters = 0;
     static uint32_t dbg_no_ball = 0;
     static uint32_t dbg_ball = 0;
     dbg_calls++;
@@ -118,9 +148,9 @@ uint8_t get_camera_direction()
     if (total == 0 || total > (uint32_t)(FRAME_BYTES * 2)) {
         dbg_bad_total++;
         if ((dbg_calls % 20) == 0) {
-            printf("[cam-stat] calls=%lu bad_total=%lu bad_read=%lu no_cluster=%lu no_ball=%lu ball=%lu (last total=%lu)\n",
+            printf("[cam-stat] calls=%lu bad_total=%lu bad_read=%lu no_ball=%lu ball=%lu (last total=%lu)\n",
                    (unsigned long)dbg_calls, (unsigned long)dbg_bad_total,
-                   (unsigned long)dbg_bad_read, (unsigned long)dbg_no_clusters,
+                   (unsigned long)dbg_bad_read,
                    (unsigned long)dbg_no_ball, (unsigned long)dbg_ball,
                    (unsigned long)total);
         }
@@ -132,38 +162,79 @@ uint8_t get_camera_direction()
         return CAM_NONE;
     }
 
-    int has_clusters = detect_red_blob(frame_buf, 50);
-    if (!has_clusters) dbg_no_clusters++;
+    // Build candidate list based on current mode.
+    //   RED mode:        check red only      (1 detection pass)
+    //   BLUE+GREEN mode: check blue + green  (2 detection passes)
+    // For multi-candidate modes we pick the candidate closest to frame
+    // center -- that's the ball we should chase first.
+    struct { TargetColor color; uint8_t flag; bool seen; int16_t cx; int16_t err; } cand[2];
+    int n_cand;
+    if (s_cam_mode == CAM_MODE_RED) {
+        cand[0] = { TARGET_RED, CAM_COLOR_RED, false, 0, 0 };
+        n_cand = 1;
+    } else {
+        cand[0] = { TARGET_BLUE,  CAM_COLOR_BLUE,  false, 0, 0 };
+        cand[1] = { TARGET_GREEN, CAM_COLOR_GREEN, false, 0, 0 };
+        n_cand = 2;
+    }
 
-    int16_t radius = 0;
-    float circ = 0.0f;
-    int is_ball = verify_is_ball(&radius, &circ);
+    int mid = FRAME_W / 2;
+    for (int i = 0; i < n_cand; i++) {
+        if (!detect_color_blob(frame_buf, 100, cand[i].color)) continue;
 
-    if (has_clusters && !is_ball) dbg_no_ball++;
-    if (is_ball) dbg_ball++;
+        int16_t r_px = 0;
+        float c_val = 0.0f;
+        if (!verify_is_ball(&r_px, &c_val)) continue;
+
+        int16_t cx = (int16_t)mid, cy = FRAME_H / 2;
+        get_blob_midpoint(&cx, &cy);
+        cand[i].seen = true;
+        cand[i].cx   = cx;
+        cand[i].err  = (int16_t)((int)cx - mid);
+    }
+
+    int pick = -1;
+    int best_err = 32767;
+    for (int i = 0; i < n_cand; i++) {
+        if (!cand[i].seen) continue;
+        int e = cand[i].err < 0 ? -cand[i].err : cand[i].err;
+        if (e < best_err) { best_err = e; pick = i; }
+    }
+
+    if (pick < 0) {
+        dbg_no_ball++;
+        if ((dbg_calls % 20) == 0) {
+            printf("[cam-stat] calls=%lu bad_total=%lu bad_read=%lu no_ball=%lu ball=%lu\n",
+                   (unsigned long)dbg_calls, (unsigned long)dbg_bad_total,
+                   (unsigned long)dbg_bad_read,
+                   (unsigned long)dbg_no_ball, (unsigned long)dbg_ball);
+        }
+        return CAM_NONE;
+    }
+    dbg_ball++;
+
+    // For BLUE+GREEN mode, the second detect_color_blob() overwrote module
+    // state. Re-run for the picked color so s_found / bbox / centroid match
+    // the chosen ball (callers like main.cpp's chase loop read that state
+    // via get_blob_midpoint()).
+    if (n_cand > 1) {
+        detect_color_blob(frame_buf, 100, cand[pick].color);
+        verify_is_ball(NULL, NULL);
+    }
 
     if ((dbg_calls % 20) == 0) {
-        printf("[cam-stat] calls=%lu bad_total=%lu bad_read=%lu no_cluster=%lu no_ball=%lu ball=%lu\n",
+        printf("[cam-stat] calls=%lu bad_total=%lu bad_read=%lu no_ball=%lu ball=%lu\n",
                (unsigned long)dbg_calls, (unsigned long)dbg_bad_total,
-               (unsigned long)dbg_bad_read, (unsigned long)dbg_no_clusters,
+               (unsigned long)dbg_bad_read,
                (unsigned long)dbg_no_ball, (unsigned long)dbg_ball);
     }
 
-    int16_t cx = FRAME_W / 2;
-    int16_t cy = FRAME_H / 2;
-    get_blob_midpoint(&cx, &cy);
+    int err = cand[pick].err;
+    uint8_t direction;
+    if      (err < -CAM_LOOSE_TOL)                          direction = CAM_LEFT;
+    else if (err >  CAM_LOOSE_TOL)                          direction = CAM_RIGHT;
+    else if (err >= -CAM_TIGHT_TOL && err <= CAM_TIGHT_TOL) direction = CAM_CENTER_TIGHT;
+    else                                                     direction = CAM_CENTER_LOOSE;
 
-    uint8_t direction = CAM_NONE;
-
-    if (is_ball) {
-        int mid = FRAME_W / 2;
-        int err = (int)cx - mid;   // negative = left of center, positive = right
-
-        if      (err < -CAM_LOOSE_TOL)                          direction = CAM_LEFT;
-        else if (err >  CAM_LOOSE_TOL)                          direction = CAM_RIGHT;
-        else if (err >= -CAM_TIGHT_TOL && err <= CAM_TIGHT_TOL) direction = CAM_CENTER_TIGHT;
-        else                                                     direction = CAM_CENTER_LOOSE;
-    }
-
-    return direction;
+    return direction | cand[pick].flag;
 }
